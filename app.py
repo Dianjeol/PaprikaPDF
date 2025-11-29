@@ -6,9 +6,14 @@ import html
 import gzip
 import datetime
 import io
+import uuid
+import tempfile
 from flask import Flask, request, send_file, Response, make_response
 from weasyprint import HTML
-import tempfile
+
+# --- Configuration: Use /tmp for all temporary file operations ---
+# This is the crucial fix for containerized environments like Render.
+TEMP_OUTPUT_DIR = tempfile.gettempdir() # Usually resolves to /tmp
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
@@ -346,11 +351,16 @@ def upload_file():
         
         recipes = []
         try:
-            with zipfile.ZipFile(file, 'r') as z:
+            # Save the uploaded file temporarily to disk to allow zipfile processing
+            temp_zip_path = os.path.join(TEMP_OUTPUT_DIR, str(uuid.uuid4()) + ".zip")
+            file.save(temp_zip_path)
+            
+            with zipfile.ZipFile(temp_zip_path, 'r') as z:
                 all_zip_files = z.namelist()
                 recipe_files = [f for f in all_zip_files if f.endswith('.paprikarecipe')]
                 
                 if not recipe_files:
+                    os.remove(temp_zip_path)
                     return "No .paprikarecipe files found!", 400
                 
                 for filename in recipe_files:
@@ -385,6 +395,10 @@ def upload_file():
                     except Exception as e:
                         print(f"Error in {filename}: {e}")
                         pass
+            
+            # Clean up the temporary uploaded zip file immediately
+            os.remove(temp_zip_path)
+
 
         except Exception as e:
             return f"Error reading file: {str(e)}", 400
@@ -395,10 +409,9 @@ def upload_file():
         recipes.sort(key=lambda x: x['name'])
 
         # Generate unique filename
-        import uuid
         unique_id = str(uuid.uuid4())[:8]
         
-        # Generate HTML with full images for HTML download
+        # Generate HTML content
         html_content = HTML_TEMPLATE_START
         html_content += get_cover_html(user_name)
         html_content += get_toc_html(recipes)
@@ -407,19 +420,17 @@ def upload_file():
         html_content += f'<div class="footer no-print">Compiled by {html.escape(user_name)}</div>'
         html_content += '</div></body></html>'
         
-        print(f"DEBUG: HTML Content size: {len(html_content)} bytes")
-        
-        # Save HTML
+        # --- FIX 1: Save HTML to the writable /tmp directory ---
         html_name = f"Cookbook_{unique_id}.html"
-        html_path = f"static/downloads/{html_name}"
+        html_path = os.path.join(TEMP_OUTPUT_DIR, html_name) 
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print(f"DEBUG: HTML saved: {html_path}")
         
-        # Generate PDF version
+        # --- FIX 1: Generate PDF version and save to the writable /tmp directory ---
         pdf_error = None
         pdf_name = f"Cookbook_{unique_id}.pdf"
-        pdf_path = f"static/downloads/{pdf_name}"
+        pdf_path = os.path.join(TEMP_OUTPUT_DIR, pdf_name)
         
         try:
             print(f"DEBUG: Starting PDF generation with {len(recipes)} recipes...")
@@ -433,11 +444,12 @@ def upload_file():
         except Exception as e:
             print(f"DEBUG: PDF error: {e}")
             pdf_error = str(e)
-        
-        # Return success page with download links
+            
+        # --- FIX 2: Update response to link to the new download route ---
         pdf_link = ""
         if not pdf_error:
-            pdf_link = f'<a href="/static/downloads/{pdf_name}" class="download pdf" download>Download PDF</a>'
+            # Link to the new dynamic download route
+            pdf_link = f'<a href="/downloads/{pdf_name}" class="download pdf">Download PDF</a>'
         else:
             pdf_link = f'<p class="error">Could not create PDF: {pdf_error}</p>'
         
@@ -463,7 +475,7 @@ def upload_file():
                 <p>{len(recipes)} recipes were processed.</p>
                 <div>
                     {pdf_link}
-                    <a href="/static/downloads/{html_name}" class="download" download>Download HTML</a>
+                    <a href="/downloads/{html_name}" class="download">Download HTML</a>
                 </div>
                 <br>
                 <a href="/" class="back">Create New Cookbook</a>
@@ -509,6 +521,27 @@ def upload_file():
       }
     </script>
     """
+
+# --- FIX 2: New route to serve files from the temporary directory ---
+@app.route('/downloads/<filename>')
+def serve_download(filename):
+    """Serves the requested file from the temporary directory (/tmp)."""
+    # Use os.path.join to securely construct the path within the allowed directory
+    safe_path = os.path.join(TEMP_OUTPUT_DIR, filename)
+
+    # Check if the file exists and is in the /tmp directory (for security)
+    if os.path.exists(safe_path) and safe_path.startswith(TEMP_OUTPUT_DIR):
+        # We use 'as_attachment=True' to force a download dialogue
+        response = send_file(safe_path, as_attachment=True, download_name=filename)
+        
+        # Schedule cleanup: It's good practice to try and remove the temp file
+        # after it's been sent, though this is difficult in Flask after send_file.
+        # For simplicity in this example, we rely on the OS/container to clean /tmp.
+        
+        return response
+    
+    return "File not found or access denied.", 404
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
