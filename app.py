@@ -8,32 +8,32 @@ import datetime
 import uuid
 import tempfile
 import io
-from flask import Flask, request, send_file
+import threading
+import shutil
+import time
+from flask import Flask, request, send_file, jsonify, render_template_string
 from weasyprint import HTML
 from PIL import Image
 
 # --- Configuration ---
-TEMP_OUTPUT_DIR = tempfile.gettempdir()
-MAX_IMAGE_WIDTH = 600  # Bilder verkleinern (spart RAM)
-JPEG_QUALITY = 70      # Bilder komprimieren (spart RAM)
+# Wir nutzen ein Unterverzeichnis im Temp-Ordner für bessere Sauberkeit
+BASE_TEMP_DIR = tempfile.gettempdir()
+MAX_IMAGE_WIDTH = 600
+JPEG_QUALITY = 70
+
+# --- IN-MEMORY JOB STORE (Simpel für Einzel-Instanzen) ---
+# Struktur: { 'job_id': { 'status': 'processing', 'progress': 10, 'message': '...', 'filename': None, 'error': None } }
+JOBS = {}
 
 # --- KOCHBUCH STRUKTUR ---
 COOKBOOK_ORDER = [
-    "Grundrezepte",
-    "Frühstück",
-    "Vorspeisen",
-    "Suppen",
-    "Salate",
-    "Hauptgerichte",
-    "Beilagen",
-    "Saucen, Dips & Dressings",
-    "Desserts",
-    "Backen"
+    "Grundrezepte", "Frühstück", "Vorspeisen", "Suppen", "Salate",
+    "Hauptgerichte", "Beilagen", "Saucen, Dips & Dressings", "Desserts", "Backen"
 ]
 
-app = Flask(__name__, static_folder='static', static_url_path='/static')
+app = Flask(__name__)
 
-# --- CSS STYLES ---
+# --- CSS STYLES (Unverändert) ---
 CSS_STYLES = """
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Lato:wght@400;700&family=Merriweather:ital,wght@0,300;0,400;0,700;1,300&display=swap');
 @media print { 
@@ -47,20 +47,14 @@ CSS_STYLES = """
 }
 body { font-family: 'Merriweather', serif; color: #333; line-height: 1.45; margin: 0; padding: 0; background: #fff; }
 .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-
-/* Cover Page */
 .cover-page { text-align: center; padding: 40px 20px; border: 6px double #2c3e50; height: 85vh; display: flex; flex-direction: column; justify-content: center; align-items: center; background-color: #fdfbf7; box-sizing: border-box; margin-bottom: 0; }
 .cover-subtitle { font-family: 'Lato', sans-serif; text-transform: uppercase; letter-spacing: 3px; font-size: 0.9rem; color: #e67e22; margin-bottom: 15px; }
 .cover-title { font-family: 'Playfair Display', serif; font-size: 3.8rem; line-height: 1.1; color: #2c3e50; margin: 10px 0; font-style: italic; }
 .cover-author { font-family: 'Playfair Display', serif; font-size: 1.3rem; color: #555; margin-top: 30px; font-weight: normal; }
 .cover-author strong { display: block; font-size: 1.8rem; color: #2c3e50; margin-top: 8px; }
 .cover-year { margin-top: auto; font-family: 'Lato', sans-serif; color: #999; font-size: 0.8rem; padding-top: 20px; }
-
-/* Chapter Page (New) */
 .chapter-page { display: flex; justify-content: center; align-items: center; height: 85vh; background: #2c3e50; color: #fff; text-align: center; border: 4px solid #e67e22; margin: 20px 0; }
 .chapter-title { font-family: 'Playfair Display', serif; font-size: 4rem; color: #fff; border-bottom: 3px solid #e67e22; padding-bottom: 20px; }
-
-/* TOC */
 .toc-container { padding: 20px 0; }
 .toc-title { font-family: 'Playfair Display', serif; font-size: 2.2rem; text-align: center; color: #2c3e50; margin-bottom: 30px; border-bottom: 2px solid #e67e22; display: inline-block; padding-bottom: 8px; width: 100%; }
 .toc-list { column-count: 2; column-gap: 40px; list-style: none; padding: 0; font-family: 'Lato', sans-serif; }
@@ -70,8 +64,6 @@ body { font-family: 'Merriweather', serif; color: #333; line-height: 1.45; margi
 .toc-page { font-family: 'Lato', sans-serif; color: #666; font-size: 0.85rem; min-width: 25px; text-align: right; }
 .toc-page::after { content: target-counter(attr(href), page); }
 .toc-category-header { column-span: all; font-family: 'Playfair Display', serif; font-size: 1.2rem; color: #e67e22; margin-top: 15px; margin-bottom: 5px; font-weight: bold; border-bottom: 1px solid #eee; }
-
-/* Recipe Card */
 .recipe-card { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px dashed #ccc; padding-top: 10px; page-break-after: always; }
 h1 { font-family: 'Playfair Display', serif; font-size: 2.0rem; color: #2c3e50; text-align: center; margin-bottom: 5px; margin-top: 0; }
 .meta-info-container { text-align: center; margin-bottom: 15px; }
@@ -90,12 +82,12 @@ li { margin-bottom: 4px; font-size: 0.9rem; border-bottom: 1px dotted #ddd; padd
 .footer { text-align: center; margin-top: 50px; padding-top: 20px; border-top: 1px solid #eee; color: #888; font-family: 'Lato', sans-serif; font-size: 0.8rem; }
 """
 
-# --- HTML TEMPLATES ---
+# --- HTML FRONTEND (AJAX POLLING) ---
 INDEX_HTML = """
 <!doctype html>
 <html>
 <head>
-    <title>Paprika to PDF</title>
+    <title>Paprika to PDF Converter</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f2f5; margin: 0; }
@@ -103,25 +95,20 @@ INDEX_HTML = """
         h2 { color: #2c3e50; margin-bottom: 1.5rem; }
         input[type="text"] { width: 100%; padding: 12px; margin: 8px 0 20px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 1rem; }
         input[type="file"] { width: 100%; padding: 10px; margin-bottom: 20px; background: #f8f9fa; border-radius: 6px; border: 1px dashed #ccc; box-sizing: border-box; }
-        
         button { background: #e67e22; color: white; border: none; padding: 14px 28px; font-size: 1.1rem; font-weight: 600; cursor: pointer; border-radius: 6px; transition: background 0.2s; width: 100%; }
         button:hover { background: #d35400; }
         button:disabled { background: #bdc3c7; cursor: not-allowed; }
-
-        /* Progress Bar Styles */
         .progress-container { display: none; margin-top: 25px; text-align: left; }
         .progress-bar-bg { background: #e9ecef; border-radius: 8px; height: 24px; overflow: hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,0.1); }
         .progress-bar-fill { background: linear-gradient(90deg, #e67e22, #f39c12); height: 100%; width: 0%; transition: width 0.4s ease; display: flex; align-items: center; justify-content: center; color: white; font-size: 0.8rem; font-weight: bold; text-shadow: 0 1px 1px rgba(0,0,0,0.2); }
         .status-text { margin-top: 10px; color: #7f8c8d; font-size: 0.9rem; text-align: center; font-weight: 500; }
-        
-        /* Spinner */
-        .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #bdc3c7; border-top-color: #e67e22; border-radius: 50%; animation: spin 1s infinite linear; margin-right: 8px; vertical-align: middle; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .download-btn { display: none; margin-top: 20px; background: #27ae60; text-decoration: none; padding: 12px; border-radius: 6px; color: white; font-weight: bold; display: block; }
+        .error-msg { color: #e74c3c; margin-top: 10px; font-weight: bold; display: none; }
     </style>
 </head>
 <body>
-    <div class="card" id="mainCard">
-        <h2>📚 Paprika Cookbook Converter</h2>
+    <div class="card">
+        <h2>📚 Paprika Cookbook</h2>
         <form id="uploadForm">
             <div style="text-align: left; font-size: 0.9rem; color: #555; margin-bottom: 4px;">Name for Cover:</div>
             <input type="text" name="name" value="A Food Lover" placeholder="e.g. Grandma's Kitchen">
@@ -129,15 +116,22 @@ INDEX_HTML = """
             <div style="text-align: left; font-size: 0.9rem; color: #555; margin-bottom: 4px;">Select .paprikarecipes zip:</div>
             <input type="file" name="file" id="fileInput" accept=".paprikarecipes,.zip" required>
             
-            <button type="submit" id="submitBtn">Create PDF Cookbook</button>
+            <button type="submit" id="submitBtn">Start Conversion</button>
         </form>
 
         <div class="progress-container" id="progressBox">
             <div class="progress-bar-bg">
                 <div class="progress-bar-fill" id="progressBar">0%</div>
             </div>
-            <div class="status-text" id="statusText">Starting upload...</div>
+            <div class="status-text" id="statusText">Uploading...</div>
         </div>
+        
+        <div id="resultArea" style="display:none;">
+            <a id="downloadLink" href="#" class="download-btn" style="background:#27ae60;">Download PDF</a>
+            <br>
+            <button onclick="location.reload()" style="background:#95a5a6; font-size:0.9rem;">Start Over</button>
+        </div>
+        <div class="error-msg" id="errorMsg"></div>
     </div>
 
     <script>
@@ -146,276 +140,377 @@ INDEX_HTML = """
         const progressBar = document.getElementById('progressBar');
         const statusText = document.getElementById('statusText');
         const btn = document.getElementById('submitBtn');
+        const resultArea = document.getElementById('resultArea');
+        const downloadLink = document.getElementById('downloadLink');
+        const errorMsg = document.getElementById('errorMsg');
 
         form.addEventListener('submit', function(e) {
             e.preventDefault();
-            
             const fileInput = document.getElementById('fileInput');
             if(!fileInput.files.length) return;
 
+            // Reset UI
             btn.disabled = true;
             btn.style.opacity = "0.5";
             progressBox.style.display = 'block';
+            errorMsg.style.display = 'none';
+            resultArea.style.display = 'none';
             
             const formData = new FormData(form);
-            const xhr = new XMLHttpRequest();
-
-            xhr.upload.addEventListener('progress', function(e) {
-                if (e.lengthComputable) {
-                    const percent = Math.round((e.loaded / e.total) * 40);
-                    updateBar(percent, "Uploading recipes... " + Math.round((e.loaded/e.total)*100) + "%");
-                }
+            
+            // 1. Upload File
+            fetch('/upload', { method: 'POST', body: formData })
+            .then(response => response.json())
+            .then(data => {
+                if(data.error) throw new Error(data.error);
+                pollStatus(data.job_id);
+            })
+            .catch(err => {
+                showError(err.message);
             });
-
-            xhr.upload.addEventListener('load', function() {
-                updateBar(45, "Processing images...");
-                let current = 45;
-                simTimer = setInterval(() => {
-                    if(current < 70) {
-                        current += 2;
-                        updateBar(current, "<div class='spinner'></div> Optimizing images...");
-                    } else if (current < 90) {
-                        current += 0.5;
-                        updateBar(current, "<div class='spinner'></div> Generating PDF pages...");
-                    } else if (current < 98) {
-                        current += 0.1;
-                        updateBar(current, "<div class='spinner'></div> Finalizing PDF...");
-                    }
-                }, 1000);
-            });
-
-            xhr.addEventListener('load', function() {
-                clearInterval(simTimer);
-                if (xhr.status === 200) {
-                    updateBar(100, "Done!");
-                    document.write(xhr.responseText);
-                } else {
-                    updateBar(100, "Error!");
-                    progressBar.style.background = "#e74c3c";
-                    statusText.innerText = "Error: " + xhr.responseText;
-                    btn.disabled = false;
-                    btn.style.opacity = "1";
-                }
-            });
-
-            xhr.addEventListener('error', function() {
-                clearInterval(simTimer);
-                statusText.innerText = "Network Error";
-            });
-
-            let simTimer;
-            xhr.open('POST', '/', true);
-            xhr.send(formData);
         });
+
+        function pollStatus(jobId) {
+            const interval = setInterval(() => {
+                fetch('/status/' + jobId)
+                .then(res => res.json())
+                .then(data => {
+                    updateBar(data.progress, data.message);
+                    
+                    if(data.state === 'complete') {
+                        clearInterval(interval);
+                        showSuccess(jobId, data.filename);
+                    } else if (data.state === 'error') {
+                        clearInterval(interval);
+                        showError(data.error);
+                    }
+                })
+                .catch(() => {
+                    // Ignore transient network errors during polling
+                });
+            }, 2000); // Check every 2 seconds
+        }
 
         function updateBar(percent, text) {
             progressBar.style.width = percent + '%';
-            progressBar.innerText = Math.floor(percent) + '%';
-            if(text) statusText.innerHTML = text;
+            progressBar.innerText = percent + '%';
+            if(text) statusText.innerText = text;
+        }
+
+        function showSuccess(jobId, filename) {
+            progressBox.style.display = 'none';
+            resultArea.style.display = 'block';
+            downloadLink.href = '/download/' + jobId;
+            downloadLink.innerText = "Download " + filename;
+            statusText.innerText = "Done!";
+        }
+
+        function showError(msg) {
+            progressBox.style.display = 'none';
+            errorMsg.innerText = "Error: " + msg;
+            errorMsg.style.display = 'block';
+            btn.disabled = false;
+            btn.style.opacity = "1";
         }
     </script>
 </body>
 </html>
 """
 
-def optimize_image(base64_str):
+# --- WORKER FUNCTIONS ---
+
+def optimize_and_save_image(base64_str, output_dir):
+    """Speichert optimiertes Bild auf Disk statt RAM und gibt den Pfad zurück."""
     if not base64_str: return None
     try:
+        filename = str(uuid.uuid4()) + ".jpg"
+        filepath = os.path.join(output_dir, filename)
+        
         img_data = base64.b64decode(base64_str)
         with Image.open(io.BytesIO(img_data)) as img:
             if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+            # Resize logic
             if img.width > MAX_IMAGE_WIDTH:
                 ratio = MAX_IMAGE_WIDTH / float(img.width)
                 new_height = int(float(img.height) * float(ratio))
                 img = img.resize((MAX_IMAGE_WIDTH, new_height), Image.Resampling.LANCZOS)
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=JPEG_QUALITY)
-            return base64.b64encode(buffer.getvalue()).decode('utf-8')
+            
+            # Save directly to disk
+            img.save(filepath, format="JPEG", quality=JPEG_QUALITY)
+            return filepath
     except Exception as e:
-        print(f"Image optimization failed: {e}")
-        return base64_str
+        print(f"Image Error: {e}")
+        return None
 
-def get_cover_html(user_name):
-    year = datetime.datetime.now().year
-    return f"""<div class="cover-page"><div class="cover-subtitle">My Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
+def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
+    """Hintergrundprozess für die PDF Erstellung"""
+    try:
+        JOBS[job_id]['status'] = 'processing'
+        JOBS[job_id]['message'] = 'Extracting recipes...'
+        JOBS[job_id]['progress'] = 5
 
-def get_chapter_html(title):
-    return f"""<div class="chapter-page"><div class="chapter-title">{html.escape(title)}</div></div>"""
-
-def get_toc_html(recipes):
-    list_items = ""
-    last_cat = None
-    
-    for recipe in recipes:
-        # Füge Kategorie-Header im Inhaltsverzeichnis ein
-        current_cat = recipe.get('category', 'Others')
-        if current_cat != last_cat:
-            list_items += f"""<li class="toc-category-header">{html.escape(current_cat)}</li>"""
-            last_cat = current_cat
-
-        anchor_id = f"recipe_{hash(recipe['name'])}"
-        recipe['anchor_id'] = anchor_id
-        list_items += f"""<li class="toc-item"><a href="#{anchor_id}"><span>{html.escape(recipe["name"])}</span><span class="toc-dots"></span><span class="toc-page" href="#{anchor_id}"></span></a></li>"""
-    
-    return f"""<div class="toc-container"><div class="toc-title">Table of Contents</div><ul class="toc-list">{list_items}</ul></div><div class="page-break"></div>"""
-
-def get_recipe_html(recipe):
-    img_html = ""
-    if recipe.get('image_data'):
-        img_html = f'<img src="data:image/jpeg;base64,{recipe["image_data"]}" class="sidebar-image">'
-
-    ing_html = "".join([f"<li>{html.escape(i)}</li>" for i in recipe['ingredients_list'] if i.strip()])
-    dir_html = ""
-    step_count = 1
-    for step in recipe['directions_list']:
-        if step.strip():
-            dir_html += f'<div class="step" data-step="{step_count}">{html.escape(step)}</div>'
-            step_count += 1
-
-    meta = []
-    if recipe.get('prep_time'): meta.append(f"Prep: {recipe['prep_time']}")
-    if recipe.get('cook_time'): meta.append(f"Cook: {recipe['cook_time']}")
-    if recipe.get('servings'): meta.append(f"Serv.: {recipe['servings']}")
-    meta_html = " &nbsp;&bull;&nbsp; ".join(meta) if meta else "&nbsp;"
-    notes_html = f'<div class="notes"><strong>Note:</strong> {html.escape(recipe["notes"])}</div>' if recipe.get('notes') else ""
-    
-    return f"""<div class="recipe-card avoid-break" id="{recipe.get('anchor_id', '')}"><h1>{html.escape(recipe['name'])}</h1><div class="meta-info-container"><div class="meta-info">{meta_html}</div></div><table class="layout-table"><tr><td class="sidebar-cell">{img_html}<h3>Ingredients</h3><ul>{ing_html}</ul></td><td class="main-cell"><h3>Directions</h3>{dir_html}{notes_html}</td></tr></table></div>"""
-
-# --- ROUTE HANDLING ---
-@app.route('/', methods=['GET', 'POST', 'HEAD'])
-def upload_file():
-    if request.method == 'GET' or request.method == 'HEAD':
-        return INDEX_HTML
-
-    if request.method == 'POST':
-        if 'file' not in request.files: return "No file uploaded!", 400
-        file = request.files['file']
-        user_name = request.form.get('name', 'A Food Lover')
-        if file.filename == '': return "No file selected", 400
-        
         recipes = []
-        try:
-            temp_zip_path = os.path.join(TEMP_OUTPUT_DIR, str(uuid.uuid4()) + ".zip")
-            file.save(temp_zip_path)
-            
-            with zipfile.ZipFile(temp_zip_path, 'r') as z:
-                all_zip_files = z.namelist()
-                recipe_files = [f for f in all_zip_files if f.endswith('.paprikarecipe')]
-                
-                if not recipe_files:
-                    os.remove(temp_zip_path)
-                    return "No .paprikarecipe files found!", 400
-                
-                for filename in recipe_files:
-                    try:
-                        raw_data = z.read(filename)
-                        try: json_str = gzip.decompress(raw_data).decode('utf-8')
-                        except: json_str = raw_data.decode('utf-8')
-
-                        data = json.loads(json_str)
-                        
-                        img_b64 = data.get('photo_data') or data.get('photoData')
-                        if not img_b64 and data.get('photo'):
-                            target = os.path.basename(data['photo'])
-                            found = next((f for f in all_zip_files if f.endswith(target)), None)
-                            if found:
-                                with z.open(found) as img: 
-                                    img_b64 = base64.b64encode(img.read()).decode('utf-8')
-                        
-                        if img_b64: img_b64 = optimize_image(img_b64)
-                        
-                        # --- KATEGORIE LOGIK ---
-                        raw_categories = data.get('categories', [])
-                        primary_category = "Sonstiges"
-                        
-                        # Versuche, eine Kategorie aus der Wunschliste zu finden
-                        found_priority = False
-                        if raw_categories:
-                            for priority_cat in COOKBOOK_ORDER:
-                                if priority_cat in raw_categories:
-                                    primary_category = priority_cat
-                                    found_priority = True
-                                    break
-                            # Wenn keine Prioritäts-Kategorie da ist, nimm die erste vorhandene
-                            if not found_priority and len(raw_categories) > 0:
-                                primary_category = raw_categories[0]
-
-                        recipes.append({
-                            'name': data.get('name', 'Untitled'),
-                            'category': primary_category, # Neue Zeile
-                            'prep_time': data.get('prep_time', ''),
-                            'cook_time': data.get('cook_time', ''),
-                            'servings': data.get('servings', ''),
-                            'image_data': img_b64, 
-                            'ingredients_list': (data.get('ingredients') or "").split('\n'),
-                            'directions_list': (data.get('directions') or "").split('\n'),
-                            'notes': data.get('notes', '')
-                        })
-                    except Exception as e:
-                        pass
-            
-            os.remove(temp_zip_path)
-        except Exception as e:
-            return f"Error reading file: {str(e)}", 400
-
-        if not recipes: return "No recipes found!", 400
         
-        # --- SORTIER LOGIK ---
+        # Ordner für Bilder innerhalb des Job-Dirs
+        img_dir = os.path.join(job_dir, "images")
+        os.makedirs(img_dir, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            all_zip_files = z.namelist()
+            recipe_files = [f for f in all_zip_files if f.endswith('.paprikarecipe')]
+            
+            total_files = len(recipe_files)
+            if total_files == 0:
+                raise Exception("No .paprikarecipe files found in ZIP")
+
+            for idx, filename in enumerate(recipe_files):
+                # Update progress based on processing
+                progress = 10 + int((idx / total_files) * 60) # 10% to 70%
+                JOBS[job_id]['progress'] = progress
+                JOBS[job_id]['message'] = f'Processing recipe {idx+1}/{total_files}...'
+
+                try:
+                    raw_data = z.read(filename)
+                    try: json_str = gzip.decompress(raw_data).decode('utf-8')
+                    except: json_str = raw_data.decode('utf-8')
+                    
+                    data = json.loads(json_str)
+                    
+                    # Bild extrahieren (Speicherschonend!)
+                    img_path = None
+                    img_b64 = data.get('photo_data') or data.get('photoData')
+                    
+                    # Fallback: Bild ist separate Datei im Zip
+                    if not img_b64 and data.get('photo'):
+                        target = os.path.basename(data['photo'])
+                        found = next((f for f in all_zip_files if f.endswith(target)), None)
+                        if found:
+                            with z.open(found) as img_f:
+                                img_b64 = base64.b64encode(img_f.read()).decode('utf-8')
+
+                    if img_b64:
+                        # WICHTIG: Speichern auf Disk, nicht im RAM halten!
+                        img_path = optimize_and_save_image(img_b64, img_dir)
+
+                    # Kategorie Logik
+                    raw_categories = data.get('categories', [])
+                    primary_category = "Sonstiges"
+                    found_priority = False
+                    if raw_categories:
+                        for priority_cat in COOKBOOK_ORDER:
+                            if priority_cat in raw_categories:
+                                primary_category = priority_cat
+                                found_priority = True
+                                break
+                        if not found_priority and raw_categories:
+                            primary_category = raw_categories[0]
+
+                    recipes.append({
+                        'name': data.get('name', 'Untitled'),
+                        'category': primary_category,
+                        'prep_time': data.get('prep_time', ''),
+                        'cook_time': data.get('cook_time', ''),
+                        'servings': data.get('servings', ''),
+                        'image_path': img_path, # Pfad statt Base64 String!
+                        'ingredients_list': (data.get('ingredients') or "").split('\n'),
+                        'directions_list': (data.get('directions') or "").split('\n'),
+                        'notes': data.get('notes', '')
+                    })
+                except Exception as e:
+                    print(f"Skipping corrupt recipe: {e}")
+
+        # Sortieren
+        JOBS[job_id]['message'] = 'Sorting and layout...'
+        JOBS[job_id]['progress'] = 75
+        
         def recipe_sorter(r):
             cat = r['category']
             name = r['name']
             if cat in COOKBOOK_ORDER:
-                # Gibt Index (0-9) zurück, damit sie oben stehen
                 return (COOKBOOK_ORDER.index(cat), name)
-            else:
-                # Alle anderen Kategorien kommen danach (Index 99 + KategorieName)
-                return (99, cat, name)
-
+            return (99, cat, name)
+        
         recipes.sort(key=recipe_sorter)
-        
-        unique_id = str(uuid.uuid4())[:8]
-        
-        html_content = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Recipe Collection</title><style>{CSS_STYLES}</style></head><body><div class="container">"""
-        html_content += get_cover_html(user_name)
-        html_content += get_toc_html(recipes)
-        
-        # --- GENERIERUNG MIT KAPITELN ---
-        last_category = None
-        for recipe in recipes:
-            current_category = recipe.get('category')
-            # Wenn sich die Kategorie ändert, füge eine Kapitelseite ein
-            if current_category != last_category:
-                html_content += get_chapter_html(current_category)
-                last_category = current_category
-                
-            html_content += get_recipe_html(recipe)
-            
-        html_content += f'<div class="footer no-print">Compiled by {html.escape(user_name)}</div></div></body></html>'
-        
-        html_name = f"Cookbook_{unique_id}.html"
-        html_path = os.path.join(TEMP_OUTPUT_DIR, html_name) 
-        with open(html_path, 'w', encoding='utf-8') as f: f.write(html_content)
-        del html_content 
-        
-        pdf_name = f"Cookbook_{unique_id}.pdf"
-        pdf_path = os.path.join(TEMP_OUTPUT_DIR, pdf_name)
-        pdf_error = None
-        try:
-            pdf_doc = HTML(filename=html_path)
-            pdf_doc.write_pdf(pdf_path)
-        except Exception as e:
-            pdf_error = str(e)
-            
-        pdf_link = f'<a href="/downloads/{pdf_name}" class="download pdf">Download PDF</a>' if not pdf_error else f'<p class="error">Error: {pdf_error}</p>'
-        
-        return f'''<!doctype html><html><head><style>body{{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f4}}.card{{background:white;padding:40px;border-radius:8px;box-shadow:0 4px 15px rgba(0,0,0,0.1);text-align:center;max-width:500px}}a.download{{display:inline-block;background:#27ae60;color:white;padding:15px 30px;text-decoration:none;border-radius:4px;margin:10px}}a.download.pdf{{background:#e74c3c}}.error{{color:red}}</style></head><body><div class="card"><h2>Cookbook Ready!</h2><p>{len(recipes)} recipes processed.</p><div>{pdf_link}<a href="/downloads/{html_name}" class="download">Download HTML</a></div><br><a href="/" style="color:#e67e22">Start Over</a></div></body></html>'''
 
-@app.route('/downloads/<filename>')
-def serve_download(filename):
-    safe_path = os.path.join(TEMP_OUTPUT_DIR, filename)
-    if os.path.exists(safe_path) and safe_path.startswith(TEMP_OUTPUT_DIR):
-        return send_file(safe_path, as_attachment=True, download_name=filename)
-    return "File not found.", 404
+        # HTML Generierung
+        JOBS[job_id]['message'] = 'Generating PDF pages...'
+        JOBS[job_id]['progress'] = 80
+        
+        html_content = generate_full_html(recipes, user_name)
+        
+        html_file_path = os.path.join(job_dir, "cookbook.html")
+        with open(html_file_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        
+        # Speicher freigeben vor PDF Generierung
+        del html_content
+        del recipes
+
+        # PDF Rendern
+        JOBS[job_id]['message'] = 'Rendering PDF (this takes time)...'
+        JOBS[job_id]['progress'] = 85
+        
+        pdf_filename = f"Cookbook_{uuid.uuid4().hex[:8]}.pdf"
+        pdf_path = os.path.join(job_dir, pdf_filename)
+        
+        HTML(filename=html_file_path).write_pdf(pdf_path)
+        
+        JOBS[job_id]['filename'] = pdf_filename
+        JOBS[job_id]['pdf_path'] = pdf_path
+        JOBS[job_id]['progress'] = 100
+        JOBS[job_id]['status'] = 'complete'
+        JOBS[job_id]['message'] = 'Done!'
+
+    except Exception as e:
+        print(f"Job failed: {e}")
+        JOBS[job_id]['status'] = 'error'
+        JOBS[job_id]['error'] = str(e)
+    finally:
+        # Aufräumen: Zip Datei löschen
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+
+def generate_full_html(recipes, user_name):
+    """Baut das komplette HTML. Nutzt file:// Pfade für Bilder."""
+    
+    def get_cover():
+        year = datetime.datetime.now().year
+        return f"""<div class="cover-page"><div class="cover-subtitle">My Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
+
+    def get_toc():
+        list_items = ""
+        last_cat = None
+        for recipe in recipes:
+            current_cat = recipe.get('category', 'Others')
+            if current_cat != last_cat:
+                list_items += f"""<li class="toc-category-header">{html.escape(current_cat)}</li>"""
+                last_cat = current_cat
+            anchor_id = f"recipe_{hash(recipe['name'])}"
+            recipe['anchor_id'] = anchor_id
+            list_items += f"""<li class="toc-item"><a href="#{anchor_id}"><span>{html.escape(recipe["name"])}</span><span class="toc-dots"></span><span class="toc-page" href="#{anchor_id}"></span></a></li>"""
+        return f"""<div class="toc-container"><div class="toc-title">Table of Contents</div><ul class="toc-list">{list_items}</ul></div><div class="page-break"></div>"""
+
+    content = [f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>{CSS_STYLES}</style></head><body><div class="container">"""]
+    content.append(get_cover())
+    content.append(get_toc())
+    
+    last_cat = None
+    for recipe in recipes:
+        # Kapitel Page
+        if recipe['category'] != last_cat:
+            content.append(f"""<div class="chapter-page"><div class="chapter-title">{html.escape(recipe['category'])}</div></div>""")
+            last_cat = recipe['category']
+            
+        # Recipe Page
+        img_html = ""
+        if recipe.get('image_path'):
+            # WICHTIG: Pfad für WeasyPrint muss absolut sein oder file://
+            abs_path = os.path.abspath(recipe['image_path'])
+            img_html = f'<img src="file://{abs_path}" class="sidebar-image">'
+
+        ing_html = "".join([f"<li>{html.escape(i)}</li>" for i in recipe['ingredients_list'] if i.strip()])
+        dir_html = ""
+        step_count = 1
+        for step in recipe['directions_list']:
+            if step.strip():
+                dir_html += f'<div class="step" data-step="{step_count}">{html.escape(step)}</div>'
+                step_count += 1
+                
+        meta = []
+        if recipe.get('prep_time'): meta.append(f"Prep: {recipe['prep_time']}")
+        if recipe.get('cook_time'): meta.append(f"Cook: {recipe['cook_time']}")
+        if recipe.get('servings'): meta.append(f"Serv.: {recipe['servings']}")
+        meta_html = " &nbsp;&bull;&nbsp; ".join(meta) if meta else "&nbsp;"
+        notes_html = f'<div class="notes"><strong>Note:</strong> {html.escape(recipe["notes"])}</div>' if recipe.get('notes') else ""
+        
+        content.append(f"""<div class="recipe-card avoid-break" id="{recipe.get('anchor_id', '')}"><h1>{html.escape(recipe['name'])}</h1><div class="meta-info-container"><div class="meta-info">{meta_html}</div></div><table class="layout-table"><tr><td class="sidebar-cell">{img_html}<h3>Ingredients</h3><ul>{ing_html}</ul></td><td class="main-cell"><h3>Directions</h3>{dir_html}{notes_html}</td></tr></table></div>""")
+    
+    content.append(f'<div class="footer no-print">Compiled by {html.escape(user_name)}</div></div></body></html>')
+    return "".join(content)
+
+
+# --- ROUTES ---
+
+@app.route('/')
+def index():
+    return render_template_string(INDEX_HTML)
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    file = request.files.get('file')
+    user_name = request.form.get('name', 'A Food Lover')
+    
+    if not file or file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    job_id = str(uuid.uuid4())
+    job_dir = os.path.join(BASE_TEMP_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    
+    zip_path = os.path.join(job_dir, "upload.zip")
+    file.save(zip_path)
+    
+    # Job initialisieren
+    JOBS[job_id] = {
+        'status': 'queued',
+        'progress': 0,
+        'message': 'Queued...',
+        'created_at': time.time()
+    }
+    
+    # Thread starten
+    thread = threading.Thread(target=process_cookbook_thread, args=(job_id, zip_path, user_name, job_dir))
+    thread.daemon = True # Thread stirbt, wenn App stirbt
+    thread.start()
+    
+    return jsonify({'job_id': job_id})
+
+@app.route('/status/<job_id>')
+def status(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    return jsonify({
+        'state': job['status'],
+        'progress': job.get('progress', 0),
+        'message': job.get('message', ''),
+        'filename': job.get('filename')
+    })
+
+@app.route('/download/<job_id>')
+def download_pdf(job_id):
+    job = JOBS.get(job_id)
+    if not job or job['status'] != 'complete':
+        return "File not ready or not found", 404
+    
+    return send_file(
+        job['pdf_path'], 
+        as_attachment=True, 
+        download_name=job['filename']
+    )
+
+# Cleanup Task (Optional): Löscht alte Jobs nach 1 Stunde
+def cleanup_jobs():
+    while True:
+        time.sleep(3600)
+        now = time.time()
+        to_delete = []
+        for jid, job in JOBS.items():
+            if now - job['created_at'] > 3600: # 1 Stunde alt
+                to_delete.append(jid)
+                # Ordner löschen
+                job_dir = os.path.join(BASE_TEMP_DIR, jid)
+                if os.path.exists(job_dir):
+                    shutil.rmtree(job_dir, ignore_errors=True)
+        
+        for jid in to_delete:
+            del JOBS[jid]
+
+# Start Cleanup Thread
+cleanup_thread = threading.Thread(target=cleanup_jobs, daemon=True)
+cleanup_thread.start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
