@@ -17,6 +17,20 @@ TEMP_OUTPUT_DIR = tempfile.gettempdir()
 MAX_IMAGE_WIDTH = 600  # Bilder verkleinern (spart RAM)
 JPEG_QUALITY = 70      # Bilder komprimieren (spart RAM)
 
+# --- KOCHBUCH STRUKTUR ---
+COOKBOOK_ORDER = [
+    "Grundrezepte",
+    "Frühstück",
+    "Vorspeisen",
+    "Suppen",
+    "Salate",
+    "Hauptgerichte",
+    "Beilagen",
+    "Saucen, Dips & Dressings",
+    "Desserts",
+    "Backen"
+]
+
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
 # --- CSS STYLES ---
@@ -29,15 +43,24 @@ CSS_STYLES = """
     .page-break { page-break-after: always; }
     .avoid-break { page-break-inside: avoid; }
     .cover-page { page-break-after: always; margin: 0; height: 100%; }
+    .chapter-page { page-break-before: always; page-break-after: always; }
 }
 body { font-family: 'Merriweather', serif; color: #333; line-height: 1.45; margin: 0; padding: 0; background: #fff; }
 .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+
+/* Cover Page */
 .cover-page { text-align: center; padding: 40px 20px; border: 6px double #2c3e50; height: 85vh; display: flex; flex-direction: column; justify-content: center; align-items: center; background-color: #fdfbf7; box-sizing: border-box; margin-bottom: 0; }
 .cover-subtitle { font-family: 'Lato', sans-serif; text-transform: uppercase; letter-spacing: 3px; font-size: 0.9rem; color: #e67e22; margin-bottom: 15px; }
 .cover-title { font-family: 'Playfair Display', serif; font-size: 3.8rem; line-height: 1.1; color: #2c3e50; margin: 10px 0; font-style: italic; }
 .cover-author { font-family: 'Playfair Display', serif; font-size: 1.3rem; color: #555; margin-top: 30px; font-weight: normal; }
 .cover-author strong { display: block; font-size: 1.8rem; color: #2c3e50; margin-top: 8px; }
 .cover-year { margin-top: auto; font-family: 'Lato', sans-serif; color: #999; font-size: 0.8rem; padding-top: 20px; }
+
+/* Chapter Page (New) */
+.chapter-page { display: flex; justify-content: center; align-items: center; height: 85vh; background: #2c3e50; color: #fff; text-align: center; border: 4px solid #e67e22; margin: 20px 0; }
+.chapter-title { font-family: 'Playfair Display', serif; font-size: 4rem; color: #fff; border-bottom: 3px solid #e67e22; padding-bottom: 20px; }
+
+/* TOC */
 .toc-container { padding: 20px 0; }
 .toc-title { font-family: 'Playfair Display', serif; font-size: 2.2rem; text-align: center; color: #2c3e50; margin-bottom: 30px; border-bottom: 2px solid #e67e22; display: inline-block; padding-bottom: 8px; width: 100%; }
 .toc-list { column-count: 2; column-gap: 40px; list-style: none; padding: 0; font-family: 'Lato', sans-serif; }
@@ -46,6 +69,9 @@ body { font-family: 'Merriweather', serif; color: #333; line-height: 1.45; margi
 .toc-dots { flex-grow: 1; border-bottom: 1px dotted #aaa; margin: 0 5px; position: relative; top: -4px; }
 .toc-page { font-family: 'Lato', sans-serif; color: #666; font-size: 0.85rem; min-width: 25px; text-align: right; }
 .toc-page::after { content: target-counter(attr(href), page); }
+.toc-category-header { column-span: all; font-family: 'Playfair Display', serif; font-size: 1.2rem; color: #e67e22; margin-top: 15px; margin-bottom: 5px; font-weight: bold; border-bottom: 1px solid #eee; }
+
+/* Recipe Card */
 .recipe-card { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px dashed #ccc; padding-top: 10px; page-break-after: always; }
 h1 { font-family: 'Playfair Display', serif; font-size: 2.0rem; color: #2c3e50; text-align: center; margin-bottom: 5px; margin-top: 0; }
 .meta-info-container { text-align: center; margin-bottom: 15px; }
@@ -213,12 +239,24 @@ def get_cover_html(user_name):
     year = datetime.datetime.now().year
     return f"""<div class="cover-page"><div class="cover-subtitle">My Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from the kitchen of<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
 
+def get_chapter_html(title):
+    return f"""<div class="chapter-page"><div class="chapter-title">{html.escape(title)}</div></div>"""
+
 def get_toc_html(recipes):
     list_items = ""
+    last_cat = None
+    
     for recipe in recipes:
+        # Füge Kategorie-Header im Inhaltsverzeichnis ein
+        current_cat = recipe.get('category', 'Others')
+        if current_cat != last_cat:
+            list_items += f"""<li class="toc-category-header">{html.escape(current_cat)}</li>"""
+            last_cat = current_cat
+
         anchor_id = f"recipe_{hash(recipe['name'])}"
         recipe['anchor_id'] = anchor_id
         list_items += f"""<li class="toc-item"><a href="#{anchor_id}"><span>{html.escape(recipe["name"])}</span><span class="toc-dots"></span><span class="toc-page" href="#{anchor_id}"></span></a></li>"""
+    
     return f"""<div class="toc-container"><div class="toc-title">Table of Contents</div><ul class="toc-list">{list_items}</ul></div><div class="page-break"></div>"""
 
 def get_recipe_html(recipe):
@@ -244,10 +282,8 @@ def get_recipe_html(recipe):
     return f"""<div class="recipe-card avoid-break" id="{recipe.get('anchor_id', '')}"><h1>{html.escape(recipe['name'])}</h1><div class="meta-info-container"><div class="meta-info">{meta_html}</div></div><table class="layout-table"><tr><td class="sidebar-cell">{img_html}<h3>Ingredients</h3><ul>{ing_html}</ul></td><td class="main-cell"><h3>Directions</h3>{dir_html}{notes_html}</td></tr></table></div>"""
 
 # --- ROUTE HANDLING ---
-# Wir erlauben GET, POST und HEAD (für UptimeRobot)
 @app.route('/', methods=['GET', 'POST', 'HEAD'])
 def upload_file():
-    # UptimeRobot sendet oft HEAD requests. Wir behandeln diese wie GET.
     if request.method == 'GET' or request.method == 'HEAD':
         return INDEX_HTML
 
@@ -288,8 +324,25 @@ def upload_file():
                         
                         if img_b64: img_b64 = optimize_image(img_b64)
                         
+                        # --- KATEGORIE LOGIK ---
+                        raw_categories = data.get('categories', [])
+                        primary_category = "Sonstiges"
+                        
+                        # Versuche, eine Kategorie aus der Wunschliste zu finden
+                        found_priority = False
+                        if raw_categories:
+                            for priority_cat in COOKBOOK_ORDER:
+                                if priority_cat in raw_categories:
+                                    primary_category = priority_cat
+                                    found_priority = True
+                                    break
+                            # Wenn keine Prioritäts-Kategorie da ist, nimm die erste vorhandene
+                            if not found_priority and len(raw_categories) > 0:
+                                primary_category = raw_categories[0]
+
                         recipes.append({
                             'name': data.get('name', 'Untitled'),
+                            'category': primary_category, # Neue Zeile
                             'prep_time': data.get('prep_time', ''),
                             'cook_time': data.get('cook_time', ''),
                             'servings': data.get('servings', ''),
@@ -306,13 +359,37 @@ def upload_file():
             return f"Error reading file: {str(e)}", 400
 
         if not recipes: return "No recipes found!", 400
-        recipes.sort(key=lambda x: x['name'])
+        
+        # --- SORTIER LOGIK ---
+        def recipe_sorter(r):
+            cat = r['category']
+            name = r['name']
+            if cat in COOKBOOK_ORDER:
+                # Gibt Index (0-9) zurück, damit sie oben stehen
+                return (COOKBOOK_ORDER.index(cat), name)
+            else:
+                # Alle anderen Kategorien kommen danach (Index 99 + KategorieName)
+                return (99, cat, name)
+
+        recipes.sort(key=recipe_sorter)
+        
         unique_id = str(uuid.uuid4())[:8]
         
         html_content = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Recipe Collection</title><style>{CSS_STYLES}</style></head><body><div class="container">"""
         html_content += get_cover_html(user_name)
         html_content += get_toc_html(recipes)
-        for recipe in recipes: html_content += get_recipe_html(recipe)
+        
+        # --- GENERIERUNG MIT KAPITELN ---
+        last_category = None
+        for recipe in recipes:
+            current_category = recipe.get('category')
+            # Wenn sich die Kategorie ändert, füge eine Kapitelseite ein
+            if current_category != last_category:
+                html_content += get_chapter_html(current_category)
+                last_category = current_category
+                
+            html_content += get_recipe_html(recipe)
+            
         html_content += f'<div class="footer no-print">Compiled by {html.escape(user_name)}</div></div></body></html>'
         
         html_name = f"Cookbook_{unique_id}.html"
