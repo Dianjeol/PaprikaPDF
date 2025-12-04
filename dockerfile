@@ -33,5 +33,5 @@ EXPOSE 8080
 
 # 8. Start command (UPDATED)
 # --workers 1: Only run one process to save RAM
-# --timeout 120: Allow up to 2 minutes for PDF generation before killing it
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "120", "app:app"]
+# --timeout 300: Allow up to 5 minutes for PDF generation before killing it
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "300", "app:app"]
