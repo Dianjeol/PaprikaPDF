@@ -237,7 +237,7 @@ def optimize_image(base64_str):
 
 def get_cover_html(user_name):
     year = datetime.datetime.now().year
-    return f"""<div class="cover-page"><div class="cover-subtitle">My Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from the kitchen of<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
+    return f"""<div class="cover-page"><div class="cover-subtitle">My Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
 
 def get_chapter_html(title):
     return f"""<div class="chapter-page"><div class="chapter-title">{html.escape(title)}</div></div>"""
