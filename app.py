@@ -16,16 +16,14 @@ from weasyprint import HTML
 from PIL import Image
 
 # --- Configuration ---
-# Wir nutzen ein Unterverzeichnis im Temp-Ordner für bessere Sauberkeit
 BASE_TEMP_DIR = tempfile.gettempdir()
 MAX_IMAGE_WIDTH = 600
 JPEG_QUALITY = 70
 
-# --- IN-MEMORY JOB STORE (Simpel für Einzel-Instanzen) ---
-# Struktur: { 'job_id': { 'status': 'processing', 'progress': 10, 'message': '...', 'filename': None, 'error': None } }
+# --- IN-MEMORY JOB STORE ---
 JOBS = {}
 
-# --- KOCHBUCH STRUKTUR ---
+# --- KOCHBUCH KATEGORIEN ---
 COOKBOOK_ORDER = [
     "Grundrezepte", "Frühstück", "Vorspeisen", "Suppen", "Salate",
     "Hauptgerichte", "Beilagen", "Saucen, Dips & Dressings", "Desserts", "Backen"
@@ -33,7 +31,7 @@ COOKBOOK_ORDER = [
 
 app = Flask(__name__)
 
-# --- CSS STYLES (Unverändert) ---
+# --- CSS STYLES ---
 CSS_STYLES = """
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Lato:wght@400;700&family=Merriweather:ital,wght@0,300;0,400;0,700;1,300&display=swap');
 @media print { 
@@ -82,7 +80,7 @@ li { margin-bottom: 4px; font-size: 0.9rem; border-bottom: 1px dotted #ddd; padd
 .footer { text-align: center; margin-top: 50px; padding-top: 20px; border-top: 1px solid #eee; color: #888; font-family: 'Lato', sans-serif; font-size: 0.8rem; }
 """
 
-# --- HTML FRONTEND (AJAX POLLING) ---
+# --- HTML FRONTEND (FIXED PROGRESS BAR) ---
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -123,13 +121,13 @@ INDEX_HTML = """
             <div class="progress-bar-bg">
                 <div class="progress-bar-fill" id="progressBar">0%</div>
             </div>
-            <div class="status-text" id="statusText">Uploading...</div>
+            <div class="status-text" id="statusText">Starting...</div>
         </div>
         
         <div id="resultArea" style="display:none;">
             <a id="downloadLink" href="#" class="download-btn" style="background:#27ae60;">Download PDF</a>
             <br>
-            <button onclick="location.reload()" style="background:#95a5a6; font-size:0.9rem;">Start Over</button>
+            <button onclick="location.reload()" style="background:#95a5a6; font-size:0.9rem; border:none; padding:8px 16px; width:auto;">Start Over</button>
         </div>
         <div class="error-msg" id="errorMsg"></div>
     </div>
@@ -143,66 +141,93 @@ INDEX_HTML = """
         const resultArea = document.getElementById('resultArea');
         const downloadLink = document.getElementById('downloadLink');
         const errorMsg = document.getElementById('errorMsg');
+        
+        let maxProgress = 0;
 
         form.addEventListener('submit', function(e) {
             e.preventDefault();
             const fileInput = document.getElementById('fileInput');
             if(!fileInput.files.length) return;
 
-            // Reset UI
             btn.disabled = true;
             btn.style.opacity = "0.5";
             progressBox.style.display = 'block';
             errorMsg.style.display = 'none';
             resultArea.style.display = 'none';
+            maxProgress = 0;
+            updateBar(0, "Starting upload...");
             
             const formData = new FormData(form);
-            
-            // 1. Upload File
-            fetch('/upload', { method: 'POST', body: formData })
-            .then(response => response.json())
-            .then(data => {
-                if(data.error) throw new Error(data.error);
-                pollStatus(data.job_id);
-            })
-            .catch(err => {
-                showError(err.message);
+            const xhr = new XMLHttpRequest();
+
+            xhr.upload.addEventListener("progress", function(evt) {
+                if (evt.lengthComputable) {
+                    const percentComplete = (evt.loaded / evt.total) * 30;
+                    updateBar(percentComplete, "Uploading: " + Math.round((evt.loaded / evt.total) * 100) + "%");
+                }
+            }, false);
+
+            xhr.addEventListener("load", function() {
+                if (xhr.status === 200) {
+                    updateBar(30, "Processing on server...");
+                    const data = JSON.parse(xhr.responseText);
+                    if(data.error) {
+                        showError(data.error);
+                    } else {
+                        pollStatus(data.job_id);
+                    }
+                } else {
+                    showError("Upload failed: " + xhr.statusText);
+                }
             });
+
+            xhr.addEventListener("error", function() {
+                showError("Network error during upload.");
+            });
+
+            xhr.open("POST", "/upload");
+            xhr.send(formData);
         });
 
         function pollStatus(jobId) {
             const interval = setInterval(() => {
-                fetch('/status/' + jobId)
+                fetch('/status/' + jobId + '?t=' + new Date().getTime())
                 .then(res => res.json())
                 .then(data => {
-                    updateBar(data.progress, data.message);
+                    let visualPercent = 30 + (data.progress * 0.7); 
+                    updateBar(visualPercent, data.message);
                     
                     if(data.state === 'complete') {
                         clearInterval(interval);
+                        updateBar(100, "Done!");
                         showSuccess(jobId, data.filename);
                     } else if (data.state === 'error') {
                         clearInterval(interval);
                         showError(data.error);
                     }
                 })
-                .catch(() => {
-                    // Ignore transient network errors during polling
+                .catch(err => {
+                    console.log("Polling wait...", err);
                 });
-            }, 2000); // Check every 2 seconds
+            }, 2000);
         }
 
         function updateBar(percent, text) {
-            progressBar.style.width = percent + '%';
-            progressBar.innerText = percent + '%';
+            if(percent > maxProgress) maxProgress = percent;
+            if(maxProgress > 100) maxProgress = 100;
+            progressBar.style.width = maxProgress + '%';
+            progressBar.innerText = Math.round(maxProgress) + '%';
             if(text) statusText.innerText = text;
         }
 
         function showSuccess(jobId, filename) {
-            progressBox.style.display = 'none';
-            resultArea.style.display = 'block';
-            downloadLink.href = '/download/' + jobId;
-            downloadLink.innerText = "Download " + filename;
-            statusText.innerText = "Done!";
+            setTimeout(() => {
+                progressBox.style.display = 'none';
+                resultArea.style.display = 'block';
+                downloadLink.href = '/download/' + jobId;
+                downloadLink.innerText = "Download PDF";
+                statusText.innerText = "Done!";
+            }, 500);
         }
 
         function showError(msg) {
@@ -220,7 +245,6 @@ INDEX_HTML = """
 # --- WORKER FUNCTIONS ---
 
 def optimize_and_save_image(base64_str, output_dir):
-    """Speichert optimiertes Bild auf Disk statt RAM und gibt den Pfad zurück."""
     if not base64_str: return None
     try:
         filename = str(uuid.uuid4()) + ".jpg"
@@ -229,13 +253,11 @@ def optimize_and_save_image(base64_str, output_dir):
         img_data = base64.b64decode(base64_str)
         with Image.open(io.BytesIO(img_data)) as img:
             if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-            # Resize logic
             if img.width > MAX_IMAGE_WIDTH:
                 ratio = MAX_IMAGE_WIDTH / float(img.width)
                 new_height = int(float(img.height) * float(ratio))
                 img = img.resize((MAX_IMAGE_WIDTH, new_height), Image.Resampling.LANCZOS)
             
-            # Save directly to disk
             img.save(filepath, format="JPEG", quality=JPEG_QUALITY)
             return filepath
     except Exception as e:
@@ -243,15 +265,12 @@ def optimize_and_save_image(base64_str, output_dir):
         return None
 
 def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
-    """Hintergrundprozess für die PDF Erstellung"""
     try:
         JOBS[job_id]['status'] = 'processing'
         JOBS[job_id]['message'] = 'Extracting recipes...'
         JOBS[job_id]['progress'] = 5
 
         recipes = []
-        
-        # Ordner für Bilder innerhalb des Job-Dirs
         img_dir = os.path.join(job_dir, "images")
         os.makedirs(img_dir, exist_ok=True)
 
@@ -264,8 +283,7 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
                 raise Exception("No .paprikarecipe files found in ZIP")
 
             for idx, filename in enumerate(recipe_files):
-                # Update progress based on processing
-                progress = 10 + int((idx / total_files) * 60) # 10% to 70%
+                progress = 10 + int((idx / total_files) * 60)
                 JOBS[job_id]['progress'] = progress
                 JOBS[job_id]['message'] = f'Processing recipe {idx+1}/{total_files}...'
 
@@ -276,11 +294,9 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
                     
                     data = json.loads(json_str)
                     
-                    # Bild extrahieren (Speicherschonend!)
                     img_path = None
                     img_b64 = data.get('photo_data') or data.get('photoData')
                     
-                    # Fallback: Bild ist separate Datei im Zip
                     if not img_b64 and data.get('photo'):
                         target = os.path.basename(data['photo'])
                         found = next((f for f in all_zip_files if f.endswith(target)), None)
@@ -289,10 +305,8 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
                                 img_b64 = base64.b64encode(img_f.read()).decode('utf-8')
 
                     if img_b64:
-                        # WICHTIG: Speichern auf Disk, nicht im RAM halten!
                         img_path = optimize_and_save_image(img_b64, img_dir)
 
-                    # Kategorie Logik
                     raw_categories = data.get('categories', [])
                     primary_category = "Sonstiges"
                     found_priority = False
@@ -311,7 +325,7 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
                         'prep_time': data.get('prep_time', ''),
                         'cook_time': data.get('cook_time', ''),
                         'servings': data.get('servings', ''),
-                        'image_path': img_path, # Pfad statt Base64 String!
+                        'image_path': img_path,
                         'ingredients_list': (data.get('ingredients') or "").split('\n'),
                         'directions_list': (data.get('directions') or "").split('\n'),
                         'notes': data.get('notes', '')
@@ -319,7 +333,6 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
                 except Exception as e:
                     print(f"Skipping corrupt recipe: {e}")
 
-        # Sortieren
         JOBS[job_id]['message'] = 'Sorting and layout...'
         JOBS[job_id]['progress'] = 75
         
@@ -332,7 +345,6 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
         
         recipes.sort(key=recipe_sorter)
 
-        # HTML Generierung
         JOBS[job_id]['message'] = 'Generating PDF pages...'
         JOBS[job_id]['progress'] = 80
         
@@ -342,11 +354,9 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
         with open(html_file_path, "w", encoding="utf-8") as f:
             f.write(html_content)
         
-        # Speicher freigeben vor PDF Generierung
         del html_content
         del recipes
 
-        # PDF Rendern
         JOBS[job_id]['message'] = 'Rendering PDF (this takes time)...'
         JOBS[job_id]['progress'] = 85
         
@@ -366,14 +376,10 @@ def process_cookbook_thread(job_id, zip_path, user_name, job_dir):
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['error'] = str(e)
     finally:
-        # Aufräumen: Zip Datei löschen
         if os.path.exists(zip_path):
             os.remove(zip_path)
 
-
 def generate_full_html(recipes, user_name):
-    """Baut das komplette HTML. Nutzt file:// Pfade für Bilder."""
-    
     def get_cover():
         year = datetime.datetime.now().year
         return f"""<div class="cover-page"><div class="cover-subtitle">My Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
@@ -397,15 +403,12 @@ def generate_full_html(recipes, user_name):
     
     last_cat = None
     for recipe in recipes:
-        # Kapitel Page
         if recipe['category'] != last_cat:
             content.append(f"""<div class="chapter-page"><div class="chapter-title">{html.escape(recipe['category'])}</div></div>""")
             last_cat = recipe['category']
             
-        # Recipe Page
         img_html = ""
         if recipe.get('image_path'):
-            # WICHTIG: Pfad für WeasyPrint muss absolut sein oder file://
             abs_path = os.path.abspath(recipe['image_path'])
             img_html = f'<img src="file://{abs_path}" class="sidebar-image">'
 
@@ -429,7 +432,6 @@ def generate_full_html(recipes, user_name):
     content.append(f'<div class="footer no-print">Compiled by {html.escape(user_name)}</div></div></body></html>')
     return "".join(content)
 
-
 # --- ROUTES ---
 
 @app.route('/')
@@ -451,7 +453,6 @@ def upload():
     zip_path = os.path.join(job_dir, "upload.zip")
     file.save(zip_path)
     
-    # Job initialisieren
     JOBS[job_id] = {
         'status': 'queued',
         'progress': 0,
@@ -459,9 +460,8 @@ def upload():
         'created_at': time.time()
     }
     
-    # Thread starten
     thread = threading.Thread(target=process_cookbook_thread, args=(job_id, zip_path, user_name, job_dir))
-    thread.daemon = True # Thread stirbt, wenn App stirbt
+    thread.daemon = True
     thread.start()
     
     return jsonify({'job_id': job_id})
@@ -491,16 +491,14 @@ def download_pdf(job_id):
         download_name=job['filename']
     )
 
-# Cleanup Task (Optional): Löscht alte Jobs nach 1 Stunde
 def cleanup_jobs():
     while True:
         time.sleep(3600)
         now = time.time()
         to_delete = []
         for jid, job in JOBS.items():
-            if now - job['created_at'] > 3600: # 1 Stunde alt
+            if now - job['created_at'] > 3600:
                 to_delete.append(jid)
-                # Ordner löschen
                 job_dir = os.path.join(BASE_TEMP_DIR, jid)
                 if os.path.exists(job_dir):
                     shutil.rmtree(job_dir, ignore_errors=True)
@@ -508,7 +506,6 @@ def cleanup_jobs():
         for jid in to_delete:
             del JOBS[jid]
 
-# Start Cleanup Thread
 cleanup_thread = threading.Thread(target=cleanup_jobs, daemon=True)
 cleanup_thread.start()
 
