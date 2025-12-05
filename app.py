@@ -398,7 +398,7 @@ def generate_full_html(recipes, user_name):
     # 1. Cover Page
     def get_cover():
         year = datetime.datetime.now().year
-        return f"""<div class="cover-page"><div class="cover-subtitle">My Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
+        return f"""<div class="cover-page"><div class="cover-subtitle">Personal</div><div class="cover-title">Recipe<br>Collection</div><div class="cover-icon">♨</div><div class="cover-author">from<br><strong>{html.escape(user_name)}</strong></div><div class="cover-year">{year}</div></div>"""
 
     # 2. Main Global TOC
     def get_toc():
